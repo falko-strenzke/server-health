@@ -1,0 +1,15 @@
+[package]
+name = "server-health"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.8"
+mail-builder = "0.4.4"
+mail-send = "0.5.2"
+reqwest = "0.13.1"
+rustls = "0.23.36"
+send-mail = "0.1.1"
+serde = "1.0.228"
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
