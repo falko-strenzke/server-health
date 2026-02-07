@@ -7,11 +7,12 @@ use std::io::{self, Write};
 use std::io::{Error, ErrorKind};
 use std::process::{Command, Stdio};
 
-use crate::config::{ServerHealthConfig,SendMailConfig};
+use crate::config::{ServerHealthConfig,SendMailConfig, Target, Action};
 
 use reqwest::{Client, Response};
 //use serde::{Deserialize, Serialize};
 use tokio::time::{self, Duration};
+use std::task;
 
 use mail_builder::MessageBuilder;
 use mail_send::{SmtpClientBuilder,Credentials};
@@ -21,6 +22,12 @@ use mail_send::{SmtpClientBuilder,Credentials};
  * send mails: https://docs.rs/mail-send/latest/mail_send/
  *
  */
+
+#[derive(Debug, Clone)]
+pub struct ServerStatus {
+pub status_code: u16,
+pub overall_ok: bool
+}
 
 #[tokio::main]
 async fn main() {
@@ -47,16 +54,14 @@ async fn main() {
     let conf: ServerHealthConfig = serde_json::from_str(&contents).unwrap();
     let send_mail_config = &conf.send_mail;
 
-    let resp = check_websites();
-    let status_code = resp.await.status().as_u16();
-    println!("response = {}", status_code);
-    if status_code >= 400 {
-        println! {"error from server!"}
-    } else {
-        println! {"server is OK"}
+    for target in conf.targets {
+        process_target(&target, &send_mail_config).await;
     }
-    send_mail(send_mail_config).await;
-    let script_result = run_script("/usr/bin/lsalsdfja");
+
+    // let resp = check_websites();
+    // let status_code = resp.await.status().as_u16();
+    // send_mail(send_mail_config).await;
+    let script_result = run_script("/usr/bin/ls");
     match script_result {
         Ok(msg) => println!("output from script: {}", msg),
         Err(e) =>  println!("error from script execution: {}", e)
@@ -93,7 +98,7 @@ pub fn run_script(script_path: &str) -> Result<String, io::Error> {
     }
 }
 
-async fn check_websites() -> Response {
+async fn check_website_health(url : &String) -> ServerStatus {
     // TODO: catch timeout:
     // thread 'main' (2647308) panicked at src/main.rs:28:78:
     // called `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Request, url: "https://dpd
@@ -105,24 +110,32 @@ async fn check_websites() -> Response {
         .build()
         .unwrap();
     let response = client
-        .get("https://dpdict.net".to_string())
+        .get(url)
         .send()
         .await
-        .unwrap();
-    return response;
+        .unwrap(); // catch dns lookup error
+
+    let status_code = response.status().as_u16();
+    println!("response = {}", status_code);
+    if status_code != 200{
+        println! {"unexpected status code from server!"}
+        return ServerStatus{ status_code, overall_ok: false};
+    } else {
+        return ServerStatus{ status_code, overall_ok: true};
+    }
 }
 
-async fn send_mail(send_mail_config : &SendMailConfig) {
+async fn send_mail(send_mail_config : &SendMailConfig, body: &String, recipients: &Vec<(String, String)>) {
+    println!("sending mail to {} recipients", recipients.len());
+   // recipients : Vec<(String, String)> = Vec::new();
     // Build a simple multipart message
     let message = MessageBuilder::new()
         .from((send_mail_config.mail_address.clone(), send_mail_config.mail_address.clone()))
-        .to(vec![
-            ("Jane Doe", "falkostrenzke@gmail.com"), //,
-                                                     //("James Smith", "james@test.com"),
-        ])
+        //.to(vec![ ("Jane Doe", "falkostrenzke@gmail.com"), //,
+        .to(recipients.to_owned())
         .subject("Hi!")
-        .html_body("<h1>Hello, world!</h1>")
-        .text_body("Hello world!");
+        .html_body(format!("<h1>{}</h1>", body))
+        .text_body(format!("{}", body));
 
     // Connect to the SMTP submissions port, upgrade to TLS and
     // authenticate using the provided credentials.
@@ -136,4 +149,37 @@ async fn send_mail(send_mail_config : &SendMailConfig) {
         .send(message)
         .await
         .unwrap();
+}
+
+async fn server_health_retries(target_conf : &Target, nb_tries : u16) -> ServerStatus {
+    let mut result = ServerStatus { status_code: 0, overall_ok: false};
+    for _ in 0..nb_tries {
+       let server_status = check_website_health(&target_conf.watch_url) ;
+        result = server_status.await.clone();
+       if result.overall_ok {
+          break;   
+       }
+        tokio::time::sleep(Duration::from_secs(target_conf.wait_between_tries_secs)).await;
+        //task::sleep(delay).await;
+    }
+    return result;
+}
+
+fn build_mail_recipients(target_conf : &Target) -> Vec<(String, String)> {
+    let mut result : Vec<(String, String)> = Vec::new();
+    for r in &target_conf.recipients {
+        result.push((r.clone(), r.clone()));
+    }
+    return result;
+}
+
+async fn process_target(target_conf: &Target, send_mail_config: &SendMailConfig) {
+    let nb_tries = target_conf.retries_before_actions + 1;
+    let server_status = server_health_retries(&target_conf, nb_tries).await;
+    let recipients = build_mail_recipients(target_conf);
+    if !server_status.overall_ok  {
+        let msg : String = format!("server status of target {} not OK (status code = {})", target_conf.watch_url, server_status.status_code);
+        send_mail(send_mail_config, &msg, &recipients).await;
+    }
+    // TODO: execute actions, check health after each and inform recipients
 }
