@@ -1,32 +1,58 @@
-
 mod config;
+mod messages;
 
 use std::env;
 use std::fs;
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::io::{Error, ErrorKind};
 use std::process::{Command, Stdio};
 
-use crate::config::{ServerHealthConfig,SendMailConfig, Target, Action};
+use crate::config::{Action, ActionTypeSpec, SendMailConfig, ServerHealthConfig, Target};
+use crate::messages::MailMessage;
 
 use reqwest::{Client, Response};
 //use serde::{Deserialize, Serialize};
 use tokio::time::{self, Duration};
-use std::task;
 
 use mail_builder::MessageBuilder;
-use mail_send::{SmtpClientBuilder,Credentials};
-
+use mail_send::{Credentials, SmtpClientBuilder};
 
 /*
- * send mails: https://docs.rs/mail-send/latest/mail_send/
- *
+ * TODO: inotify to wait on config: https://docs.rs/inotify/latest/inotify/struct.Inotify.html#method.read_events
  */
 
 #[derive(Debug, Clone)]
 pub struct ServerStatus {
-pub status_code: u16,
-pub overall_ok: bool
+    pub status_code: u16,
+    pub overall_ok: bool,
+    pub exec_error_msg: String
+}
+
+async fn update_config_indicate_success(
+    config_path: String,
+    previous_config_opt: &Option<ServerHealthConfig>,
+) -> (ServerHealthConfig, bool) {
+    let contents =
+        fs::read_to_string(config_path.clone()).expect("Should have been able to read the file");
+
+    let parse_result = serde_json::from_str(&contents);
+    match parse_result {
+        Ok(config) => (config, true),
+        Err(e) => {
+            if previous_config_opt.is_some() {
+                let msg = messages::MailMessage {
+                    body: format!("server health failed to parse config file {} due to error: {}", config_path, e),
+                    subject: "server health failed to parse config file".to_string(),
+                };
+                send_mail(&previous_config_opt.as_ref().unwrap().send_mail, &msg, build_mail_recipients(&previous_config_opt.as_ref().unwrap().admin_recipients).as_ref()).await;
+                return (previous_config_opt.as_ref().unwrap().clone(), false);
+            }
+            else {
+                panic!("could not load initial config, aborting")
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -35,7 +61,6 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -43,29 +68,29 @@ async fn main() {
         return;
     }
     let input_file_path = args[1].clone();
+    let mut previous_config_opt: Option<ServerHealthConfig> = None;
+    let mut targets_known_down: HashSet<usize> = HashSet::new();
+    loop {
+        // re-read the config after each check
+        println!("going to read the config file");
+        let (new_config, read_config_success) = update_config_indicate_success(input_file_path.clone(), &previous_config_opt).await;
+        previous_config_opt = Some(new_config.clone());
+        if read_config_success  {
+            for (t_idx, target) in new_config.targets.iter().enumerate() {
+                let is_up_now = process_target_report_is_up(&target, &new_config.send_mail, !targets_known_down.contains(&t_idx)).await;
+                if !is_up_now {
+                    targets_known_down.insert(t_idx);
+                }
+                else
+                {
+                  targets_known_down.remove(&t_idx);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(new_config.watch_intervall_secs)).await;
 
-    let contents =
-        fs::read_to_string(input_file_path).expect("Should have been able to read the file");
-
-    //println!("{contents}")
-    //
-    //print_example_landscape();
-
-    let conf: ServerHealthConfig = serde_json::from_str(&contents).unwrap();
-    let send_mail_config = &conf.send_mail;
-
-    for target in conf.targets {
-        process_target(&target, &send_mail_config).await;
     }
 
-    // let resp = check_websites();
-    // let status_code = resp.await.status().as_u16();
-    // send_mail(send_mail_config).await;
-    let script_result = run_script("/usr/bin/ls");
-    match script_result {
-        Ok(msg) => println!("output from script: {}", msg),
-        Err(e) =>  println!("error from script execution: {}", e)
-    }
 }
 
 pub fn run_script(script_path: &str) -> Result<String, io::Error> {
@@ -98,49 +123,53 @@ pub fn run_script(script_path: &str) -> Result<String, io::Error> {
     }
 }
 
-async fn check_website_health(url : &String) -> ServerStatus {
-    // TODO: catch timeout:
-    // thread 'main' (2647308) panicked at src/main.rs:28:78:
-    // called `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Request, url: "https://dpd
-    // ict.net/", source: TimedOut }
-    //let client = Client::new();
+async fn check_website_health(url: &String) -> Result<ServerStatus, reqwest::Error> {
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
-        //.timeout(Duration::from_micros(1))
-        .build()
-        .unwrap();
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .unwrap(); // catch dns lookup error
+        .build()?;
+    let response = client.get(url).send().await?; 
 
     let status_code = response.status().as_u16();
     println!("response = {}", status_code);
-    if status_code != 200{
+    if status_code != 200 {
         println! {"unexpected status code from server!"}
-        return ServerStatus{ status_code, overall_ok: false};
+        return Ok(ServerStatus {
+            status_code,
+            overall_ok: false,
+            exec_error_msg: String::new()
+        });
     } else {
-        return ServerStatus{ status_code, overall_ok: true};
+        return Ok(ServerStatus {
+            status_code,
+            overall_ok: true,
+            exec_error_msg: String::new()
+        });
     }
 }
 
-async fn send_mail(send_mail_config : &SendMailConfig, body: &String, recipients: &Vec<(String, String)>) {
+async fn send_mail(
+    send_mail_config: &SendMailConfig,
+    msg: &MailMessage,
+    recipients: &Vec<(String, String)>,
+) {
     println!("sending mail to {} recipients", recipients.len());
-   // recipients : Vec<(String, String)> = Vec::new();
     // Build a simple multipart message
     let message = MessageBuilder::new()
-        .from((send_mail_config.mail_address.clone(), send_mail_config.mail_address.clone()))
+        .from((
+            send_mail_config.mail_address.clone(),
+            send_mail_config.mail_address.clone(),
+        ))
         //.to(vec![ ("Jane Doe", "falkostrenzke@gmail.com"), //,
         .to(recipients.to_owned())
-        .subject("Hi!")
-        .html_body(format!("<h1>{}</h1>", body))
-        .text_body(format!("{}", body));
+        .subject(msg.subject.clone())
+        .html_body(format!("<p>{}</p>", msg.body))
+        .text_body(format!("{}", msg.body));
 
     // Connect to the SMTP submissions port, upgrade to TLS and
     // authenticate using the provided credentials.
     //let cred : Credentials<&String> = Credentials::Plain {username: &"".to_string(), secret: &"".to_string()};
-    let cred : Credentials<&String> = Credentials::new(&send_mail_config.user_name, &send_mail_config.password);
+    let cred: Credentials<&String> =
+        Credentials::new(&send_mail_config.user_name, &send_mail_config.password);
     SmtpClientBuilder::new(&send_mail_config.smtp_url, send_mail_config.port)
         .credentials(cred)
         .connect()
@@ -151,35 +180,111 @@ async fn send_mail(send_mail_config : &SendMailConfig, body: &String, recipients
         .unwrap();
 }
 
-async fn server_health_retries(target_conf : &Target, nb_tries : u16) -> ServerStatus {
-    let mut result = ServerStatus { status_code: 0, overall_ok: false};
+async fn server_health_retries(target_conf: &Target, nb_tries: u16) -> ServerStatus {
+    let mut result = ServerStatus {
+        status_code: 0,
+        overall_ok: false,
+        exec_error_msg: String::new()
+    };
     for _ in 0..nb_tries {
-       let server_status = check_website_health(&target_conf.watch_url) ;
-        result = server_status.await.clone();
-       if result.overall_ok {
-          break;   
-       }
+        let server_status_result = check_website_health(&target_conf.watch_url);
+        match server_status_result.await {
+            Ok(status) => {
+                result = status.clone();
+                if result.overall_ok {
+                    break;
+                }
+            }
+            ,
+            Err(e) => {
+    result = ServerStatus {
+        status_code: 0,
+        overall_ok: false,
+        exec_error_msg: format!("Exception occured: {}", e),
+    };
+            }
+        }
+        // Note: currently, all results except the one from the last retry get swallowed here and
+        // are not reported.
         tokio::time::sleep(Duration::from_secs(target_conf.wait_between_tries_secs)).await;
-        //task::sleep(delay).await;
     }
     return result;
 }
 
-fn build_mail_recipients(target_conf : &Target) -> Vec<(String, String)> {
-    let mut result : Vec<(String, String)> = Vec::new();
-    for r in &target_conf.recipients {
+fn build_mail_recipients(vec_of_mail_address: &Vec<String>) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    for r in vec_of_mail_address {
         result.push((r.clone(), r.clone()));
     }
     return result;
 }
 
-async fn process_target(target_conf: &Target, send_mail_config: &SendMailConfig) {
+async fn process_target_report_is_up(target_conf: &Target, send_mail_config: &SendMailConfig, target_known_up: bool) -> bool {
     let nb_tries = target_conf.retries_before_actions + 1;
-    let server_status = server_health_retries(&target_conf, nb_tries).await;
-    let recipients = build_mail_recipients(target_conf);
-    if !server_status.overall_ok  {
-        let msg : String = format!("server status of target {} not OK (status code = {})", target_conf.watch_url, server_status.status_code);
-        send_mail(send_mail_config, &msg, &recipients).await;
+    let mut server_status = server_health_retries(&target_conf, nb_tries).await;
+    let recipients = build_mail_recipients(&target_conf.recipients);
+    let mut last_action_output: Option<String> = None;
+    //let actions_exhausted = false;
+    let mut action_idx: usize = 0;
+    if !server_status.overall_ok {
+        while action_idx < target_conf.actions.len() {
+            if target_known_up {
+                let msg: MailMessage = messages::make_message_will_take_action(
+                    &target_conf,
+                    action_idx,
+                    &server_status,
+                    &last_action_output,
+                );
+                send_mail(send_mail_config, &msg, &recipients).await;
+            }
+            let action: &Action = &target_conf.actions[action_idx];
+            for _ in 0..action.repeat_times {
+                last_action_output = Some(run_spefice_action(action));
+                tokio::time::sleep(Duration::from_secs(action.wait_afterwards_secs)).await;
+                server_status = server_health_retries(&target_conf, nb_tries).await;
+                if server_status.overall_ok {
+                    break;
+                }
+            }
+            action_idx += 1;
+            if action_idx == target_conf.actions.len() {
+                break;
+            }
+            if server_status.overall_ok {
+                break;
+            }
+        }
     }
-    // TODO: execute actions, check health after each and inform recipients
+    if !server_status.overall_ok {
+        if target_known_up {
+            let msg = messages::make_message_actions_exhausted(target_conf, &server_status);
+            send_mail(send_mail_config, &msg, &recipients).await;
+        }
+    }
+    else {
+        if !target_known_up {
+            let msg: MailMessage = messages::make_message_target_up_again(
+                &target_conf,
+            );
+            send_mail(send_mail_config, &msg, &recipients).await;
+        }
+        return true;
+    }
+    return server_status.overall_ok;
+}
+
+fn run_spefice_action(action: &Action) -> String {
+    match &action.typespecific {
+        ActionTypeSpec::RunScript { path_to_script } => {
+            let script_result = run_script(path_to_script.as_str());
+            match script_result {
+                Ok(text) => {
+                    format!("script output: {}", text)
+                }
+                Err(e) => {
+                    format!("error when running script: {}", e)
+                }
+            }
+        }
+    }
 }

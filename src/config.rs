@@ -1,6 +1,8 @@
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ServerHealthConfig {
     pub send_mail: SendMailConfig,
+    pub watch_intervall_secs: u64,
+    pub admin_recipients: Vec<String>,
     pub targets : Vec<Target>
 }
 
@@ -15,6 +17,7 @@ pub struct SendMailConfig {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Target {
+    pub informative_name : String,
     pub watch_url: String,
     pub timeout_secs: u16,
     pub retries_before_actions: u16,
@@ -23,7 +26,18 @@ pub struct Target {
     pub actions : Vec<Action>
 }
 
+
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub enum Action {
-    RunScript { path_to_script : String, wait_afterwards_secs : u16, repeat_times: u16 }
+pub struct Action {
+    pub informative_name : String,
+    pub wait_afterwards_secs : u64, 
+    pub repeat_times: u16,
+    pub typespecific : ActionTypeSpec
 }
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum ActionTypeSpec {
+    RunScript { path_to_script : String  }
+    }
+
