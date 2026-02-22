@@ -226,6 +226,7 @@ async fn process_target_report_is_up(target_conf: &Target, send_mail_config: &Se
     let mut last_action_output: Option<String> = None;
     //let actions_exhausted = false;
     let mut action_idx: usize = 0;
+    let mut had_to_take_action = !server_status.overall_ok;
     if !server_status.overall_ok {
         while action_idx < target_conf.actions.len() {
             if target_known_up {
@@ -262,7 +263,7 @@ async fn process_target_report_is_up(target_conf: &Target, send_mail_config: &Se
         }
     }
     else {
-        if !target_known_up {
+        if !target_known_up || had_to_take_action {
             let msg: MailMessage = messages::make_message_target_up_again(
                 &target_conf,
             );
